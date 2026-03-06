@@ -1,0 +1,34 @@
+# ── docker-compose.yml ────────────────────────────────────────────────────────
+# Usage:
+#   docker compose up -d          # start in background
+#   docker compose logs -f        # follow logs
+#   docker compose down           # stop
+#   docker compose restart        # restart after code changes
+
+services:
+  bot:
+    build: .
+    image: tg-discord-bot
+    container_name: telecord
+    restart: unless-stopped       # auto-restart on crash or VPS reboot
+
+    env_file:
+      - .env                      # loads all variables from your .env file
+
+    volumes:
+      - ./data:/app/data          # persist dedup cache across restarts
+      - ./logs:/app/logs          # persist logs across restarts
+
+    # Resource limits — fits comfortably in 100 MB RAM VPS
+    deploy:
+      resources:
+        limits:
+          memory: 90M
+        reservations:
+          memory: 64M
+
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"            # cap Docker log size
+        max-file: "3"             # keep 3 rotated log files
