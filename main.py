@@ -264,8 +264,8 @@ async def handle_new_message(event):
     # ── Format text ───────────────────────────────────────────────────────────
     formatted_text = format_message(message)
 
-    # Build source label for footer
-    channel_label = f"📢 HXG's TG Channel"
+    # Build source label for footer — set CHANNEL_FOOTER_LABEL in .env to customise
+    channel_label = os.getenv("CHANNEL_FOOTER_LABEL", "📢 HXG's TG Channel")
     discord_content = build_discord_content(formatted_text, source_label=channel_label)
 
     # ── Download media ────────────────────────────────────────────────────────
