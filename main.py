@@ -186,13 +186,32 @@ tg_client = TelegramClient(
 )
 
 
-async def resolve_channel(username: str) -> Channel | None:
+async def resolve_channel(username: str):
     """
     Resolve a channel username or numeric ID to a Telethon entity.
     Supports both '@username' and '-100xxxxxxxxx' numeric formats.
+    For private channels, uses get_dialogs() to find the channel
+    since get_entity() may fail without a prior interaction.
     """
     try:
-        entity = await tg_client.get_entity(username)
+        # Strip -100 prefix for numeric IDs and convert to int
+        if username.lstrip("-").isdigit():
+            peer_id = int(username)
+            # For private channels, iterate dialogs to find the entity
+            # since get_entity() requires a prior cache entry
+            async for dialog in tg_client.iter_dialogs():
+                if dialog.entity.id == abs(peer_id) or dialog.entity.id == peer_id:
+                    logger.info(
+                        "Resolved private channel: %s (ID: %s)",
+                        getattr(dialog.entity, "title", username),
+                        dialog.entity.id,
+                    )
+                    return dialog.entity
+            # Fallback to get_entity if not found in dialogs
+            entity = await tg_client.get_entity(peer_id)
+        else:
+            entity = await tg_client.get_entity(username)
+
         logger.info(
             "Resolved Telegram channel: %s (ID: %s)",
             getattr(entity, "title", username),
