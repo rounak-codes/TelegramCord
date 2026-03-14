@@ -64,14 +64,49 @@ if missing:
 TELEGRAM_API_ID: int = int(os.environ["TELEGRAM_API_ID"])
 TELEGRAM_API_HASH: str = os.environ["TELEGRAM_API_HASH"]
 TELEGRAM_SESSION: str = os.environ["TELEGRAM_SESSION"]
-TELEGRAM_CHANNEL_USERNAME: str = os.environ["TELEGRAM_CHANNEL_USERNAME"]
 
 DISCORD_BOT_TOKEN: str = os.environ["DISCORD_BOT_TOKEN"]
-DISCORD_CHANNEL_ID: int = int(os.environ["DISCORD_CHANNEL_ID"])
 
 # Optional: your Discord user ID to receive DM alerts (e.g. session expiry)
 # Right-click your name in Discord → Copy User ID
 DISCORD_OWNER_ID: int | None = int(os.environ["DISCORD_OWNER_ID"]) if os.getenv("DISCORD_OWNER_ID") else None
+
+# ── Multi-channel configuration ───────────────────────────────────────────────
+#
+# CHANNELS is a JSON list in your .env, each entry having:
+#   tg_channel   — Telegram channel username or numeric ID
+#   discord_id   — Discord channel ID to post to
+#   footer       — Footer label shown on every forwarded message
+#
+# Example .env value (single line):
+# CHANNELS=[{"tg_channel":"-1001234567890","discord_id":"111222333444555666","footer":"📢 HXG's TG Channel"}]
+#
+# Multiple channels example:
+# CHANNELS=[{"tg_channel":"channel1","discord_id":"111222333444555666","footer":"📢 Channel 1"},{"tg_channel":"-1009876543210","discord_id":"777888999000111222","footer":"📢 Channel 2"}]
+
+import json as _json
+
+_raw_channels = os.getenv("CHANNELS")
+if not _raw_channels:
+    # Fallback: support old single-channel env vars for backwards compatibility
+    _tg = os.getenv("TELEGRAM_CHANNEL_USERNAME")
+    _dc = os.getenv("DISCORD_CHANNEL_ID")
+    _footer = os.getenv("CHANNEL_FOOTER_LABEL", "📢 TG Channel")
+    if not _tg or not _dc:
+        logger.critical(
+            "No channel configuration found. Set CHANNELS in your .env — "
+            "see .env.example for the format."
+        )
+        sys.exit(1)
+    CHANNELS: list[dict] = [{"tg_channel": _tg, "discord_id": int(_dc), "footer": _footer}]
+else:
+    try:
+        CHANNELS = _json.loads(_raw_channels)
+        for ch in CHANNELS:
+            ch["discord_id"] = int(ch["discord_id"])
+    except Exception as exc:
+        logger.critical("Failed to parse CHANNELS env variable: %s", exc)
+        sys.exit(1)
 
 # ── Shared state ──────────────────────────────────────────────────────────────
 
@@ -119,53 +154,49 @@ async def alert_owner(message: str) -> None:
 
 async def send_to_discord(
     content: str,
+    discord_channel_id: int,
     file: discord.File | None = None,
     tg_message_id: int | None = None,
 ) -> discord.Message | None:
     """
-    Post a message (and optional file) to the configured Discord channel,
-    then crosspost it so follower servers receive the announcement.
+    Post a message (and optional file) to a Discord channel.
 
     Args:
-        content:        The formatted text to post.
-        file:           Optional discord.File attachment.
-        tg_message_id:  Used only for logging.
+        content:            The formatted text to post.
+        discord_channel_id: The Discord channel to post to.
+        file:               Optional discord.File attachment.
+        tg_message_id:      Used only for logging.
 
     Returns:
         The sent discord.Message, or None on failure.
     """
-    channel = discord_bot.get_channel(DISCORD_CHANNEL_ID)
+    channel = discord_bot.get_channel(discord_channel_id)
 
     if channel is None:
-        # Bot may not have cached it yet — fetch directly
         try:
-            channel = await discord_bot.fetch_channel(DISCORD_CHANNEL_ID)
+            channel = await discord_bot.fetch_channel(discord_channel_id)
         except discord.NotFound:
-            logger.error("Discord channel %d not found. Check DISCORD_CHANNEL_ID.", DISCORD_CHANNEL_ID)
+            logger.error("Discord channel %d not found.", discord_channel_id)
             return None
         except discord.Forbidden:
-            logger.error(
-                "Bot lacks permission to view channel %d. "
-                "Ensure it has View Channel + Send Messages.",
-                DISCORD_CHANNEL_ID,
-            )
+            logger.error("Bot lacks permission to view channel %d.", discord_channel_id)
             return None
 
     sent = None
     try:
-        # ── Send the message ──────────────────────────────────────────────────
         if file:
             sent = await channel.send(content=content, file=file)
         else:
             sent = await channel.send(content=content)
 
         logger.info(
-            "Posted to Discord | discord_msg_id=%d | tg_msg_id=%s",
+            "Posted to Discord | discord_msg_id=%d | tg_msg_id=%s | channel=%d",
             sent.id,
             tg_message_id or "N/A",
+            discord_channel_id,
         )
     except discord.Forbidden:
-        logger.error("Bot lacks Send Messages permission in channel %d.", DISCORD_CHANNEL_ID)
+        logger.error("Bot lacks Send Messages permission in channel %d.", discord_channel_id)
         return None
     except discord.HTTPException as exc:
         logger.error("Discord HTTP error while sending message: %s", exc)
@@ -223,50 +254,43 @@ async def resolve_channel(username: str):
         return None
 
 
-async def handle_new_message(event):
+async def handle_new_message(event, channel_config: dict):
     """
-    Event handler called by Telethon for every new message in the monitored
-    Telegram channel.
+    Event handler for new messages.
 
-    Flow:
-        1. Deduplication check.
-        2. Skip service messages (channel created, pinned, etc.)
-        3. Format text via utils/formatter.py.
-        4. Download media via utils/media.py.
-        5. Guard: skip if there's genuinely nothing to post.
-        6. Post to Discord.
-        7. Mark as seen in dedup cache.
+    Args:
+        event:          Telethon event object.
+        channel_config: Dict with keys tg_channel, discord_id, footer.
     """
     message = event.message
     msg_id: int = message.id
+    discord_channel_id: int = channel_config["discord_id"]
+    footer: str = channel_config["footer"]
 
-    # ── Deduplication ─────────────────────────────────────────────────────────
-    if dedup_cache.seen(msg_id):
+    # ── Deduplication — scoped per channel to avoid cross-channel conflicts ────
+    cache_key = f"{channel_config['tg_channel']}:{msg_id}"
+    if dedup_cache.seen(cache_key):
         logger.debug("Duplicate message detected (id=%d) — skipping", msg_id)
         return
 
-    # ── Skip service messages (channel created, photo changed, pinned…) ───────
-    # These have no text and no real media — only an `action` field set.
+    # ── Skip service messages ─────────────────────────────────────────────────
     if getattr(message, "action", None) is not None:
-        logger.debug("Skipping service message id=%d (action: %s)", msg_id, type(message.action).__name__)
-        dedup_cache.add(msg_id)
+        logger.debug("Skipping service message id=%d", msg_id)
+        dedup_cache.add(cache_key)
         return
 
-    # ── Skip if truly empty (no text AND no media) ────────────────────────────
+    # ── Skip empty messages ───────────────────────────────────────────────────
     raw_text = (message.text or message.message or "").strip()
     if not raw_text and not message.media:
         logger.debug("Skipping empty message id=%d", msg_id)
-        dedup_cache.add(msg_id)
+        dedup_cache.add(cache_key)
         return
 
-    logger.info("New Telegram message received | id=%d", msg_id)
+    logger.info("New message | id=%d | channel=%s", msg_id, channel_config["tg_channel"])
 
     # ── Format text ───────────────────────────────────────────────────────────
     formatted_text = format_message(message)
-
-    # Build source label for footer — set CHANNEL_FOOTER_LABEL in .env to customise
-    channel_label = os.getenv("CHANNEL_FOOTER_LABEL", "📢 HXG's TG Channel")
-    discord_content = build_discord_content(formatted_text, source_label=channel_label)
+    discord_content = build_discord_content(formatted_text, source_label=footer)
 
     # ── Download media ────────────────────────────────────────────────────────
     discord_file = None
@@ -274,16 +298,13 @@ async def handle_new_message(event):
 
     if message.media:
         discord_file, media_notice = await download_media(tg_client, message)
-
-        # If we couldn't download (too large etc.) and got a notice, append it
         if discord_file is None and media_notice:
             discord_content = (discord_content + "\n" + media_notice).strip()
 
-    # ── Guard: footer-only content means nothing real to post ─────────────────
-    # If formatted_text is None and there's no file/notice, don't post just the footer
+    # ── Guard: nothing real to post ───────────────────────────────────────────
     if not formatted_text and discord_file is None and not media_notice:
         logger.debug("Message %d has no postable content — skipping", msg_id)
-        dedup_cache.add(msg_id)
+        dedup_cache.add(cache_key)
         return
 
     # ── Post to Discord ───────────────────────────────────────────────────────
@@ -291,39 +312,29 @@ async def handle_new_message(event):
         content=discord_content,
         file=discord_file,
         tg_message_id=msg_id,
+        discord_channel_id=discord_channel_id,
     )
 
     if sent is not None:
-        # Only mark as seen after a *successful* Discord post
         logger.info("Marking tg_msg_id=%d as seen in dedup cache", msg_id)
-        dedup_cache.add(msg_id)
-    elif sent is None:
-        # Fallback: if sent is None but we got here, log it clearly
+        dedup_cache.add(cache_key)
+    else:
         logger.warning(
-            "send_to_discord returned None for tg_msg_id=%d — NOT adding to dedup cache",
+            "Discord post failed for tg_msg_id=%d — NOT adding to dedup cache",
             msg_id,
         )
 
 
-async def catchup_missed_messages(channel_entity, limit: int = 50):
+async def catchup_missed_messages(channel_entity, channel_config: dict, limit: int = 50):
     """
-    On startup, fetch recent messages from the Telegram channel and forward
-    any that were posted while the bot was offline — but ONLY within the
-    catch-up window (default: last 30 minutes).
-
-    Messages older than the window are ignored entirely, preventing the bot
-    from re-posting old content every time it restarts.
-
-    Args:
-        channel_entity: The resolved Telegram channel entity.
-        limit:          Max number of recent messages to inspect.
+    On startup, forward messages missed during downtime within the catchup window.
     """
-    # How far back to look on startup (in minutes). Adjust via env var.
     catchup_minutes = int(os.getenv("CATCHUP_WINDOW_MINUTES", "30"))
     cutoff_time = datetime.now(timezone.utc) - timedelta(minutes=catchup_minutes)
 
     logger.info(
-        "Catching up on messages from the last %d minutes (since %s)…",
+        "Catching up on '%s' — last %d minutes (since %s)…",
+        channel_config["tg_channel"],
         catchup_minutes,
         cutoff_time.strftime("%H:%M:%S UTC"),
     )
@@ -331,8 +342,6 @@ async def catchup_missed_messages(channel_entity, limit: int = 50):
 
     try:
         async for message in tg_client.iter_messages(channel_entity, limit=limit):
-            # Telethon returns messages newest-first; once we hit a message
-            # older than the cutoff we can stop — everything after is older too
             msg_time = message.date
             if msg_time.tzinfo is None:
                 from datetime import timezone as tz
@@ -345,7 +354,6 @@ async def catchup_missed_messages(channel_entity, limit: int = 50):
                 )
                 break
 
-            # Apply the same filters as the live listener
             if message.reply_to is not None:
                 continue
             if message.from_id is not None:
@@ -353,57 +361,54 @@ async def catchup_missed_messages(channel_entity, limit: int = 50):
             if getattr(message, "action", None) is not None:
                 continue
 
-            # Skip already-seen messages
-            if dedup_cache.seen(message.id):
+            cache_key = f"{channel_config['tg_channel']}:{message.id}"
+            if dedup_cache.seen(cache_key):
                 continue
 
             logger.info("Catch-up: forwarding missed message id=%d", message.id)
-            await handle_new_message(type("Event", (), {"message": message})())
+            await handle_new_message(type("Event", (), {"message": message})(), channel_config)
             caught_up += 1
-
-            # Small delay to avoid hitting Discord rate limits during catch-up
             await asyncio.sleep(1.5)
 
     except Exception as exc:
-        logger.error("Catch-up failed: %s", exc)
+        logger.error("Catch-up failed for '%s': %s", channel_config["tg_channel"], exc)
 
     if caught_up == 0:
-        logger.info("Catch-up complete — no missed messages found.")
+        logger.info("Catch-up complete for '%s' — no missed messages.", channel_config["tg_channel"])
     else:
-        logger.info("Catch-up complete — forwarded %d missed message(s).", caught_up)
+        logger.info("Catch-up complete for '%s' — forwarded %d message(s).", channel_config["tg_channel"], caught_up)
 
 
-async def start_telegram_listener(channel_entity):
+async def start_telegram_listener(channel_entities: list[tuple]):
     """
-    Register the new-message event handler and keep Telethon running.
+    Register new-message event handlers for all channels and keep Telethon running.
+
+    Args:
+        channel_entities: List of (entity, channel_config) tuples.
     """
+    for entity, config in channel_entities:
+        # Use a closure to capture config per channel
+        def make_handler(channel_config):
+            async def _handler(event):
+                if event.message.reply_to is not None:
+                    return
+                if event.message.from_id is not None:
+                    return
+                try:
+                    await handle_new_message(event, channel_config)
+                except Exception as exc:
+                    logger.exception("Unhandled error in message handler: %s", exc)
+            return _handler
 
-    @tg_client.on(events.NewMessage(chats=channel_entity))
-    async def _handler(event):
-        # Skip replies — only forward original channel posts, not comments
-        if event.message.reply_to is not None:
-            logger.debug("Skipping reply/comment message id=%d", event.message.id)
-            return
+        tg_client.add_event_handler(
+            make_handler(config),
+            events.NewMessage(chats=entity),
+        )
+        logger.info("Listener registered for channel: %s", config["tg_channel"])
 
-        # Skip messages posted by users (comments) — only forward posts
-        # made by the channel itself (from_id is None for channel posts)
-        if event.message.from_id is not None:
-            logger.debug("Skipping user message id=%d (not a channel post)", event.message.id)
-            return
-
-        # Wrap in try/except so one bad message never kills the listener
-        try:
-            await handle_new_message(event)
-        except Exception as exc:
-            logger.exception("Unhandled error in message handler: %s", exc)
-
-    logger.info(
-        "Telegram listener active — watching for new messages in '%s'",
-        TELEGRAM_CHANNEL_USERNAME,
-    )
+    logger.info("Telegram listener active — watching %d channel(s)", len(channel_entities))
     await tg_client.run_until_disconnected()
 
-    # If we reach here, Telethon disconnected unexpectedly
     if not _shutting_down:
         msg = (
             "Telegram client disconnected unexpectedly. "
@@ -476,20 +481,28 @@ async def main():
         getattr(me, "username", "N/A"),
     )
 
-    # ── Resolve target channel ────────────────────────────────────────────────
-    channel_entity = await resolve_channel(TELEGRAM_CHANNEL_USERNAME)
-    if channel_entity is None:
-        logger.critical("Cannot resolve Telegram channel — aborting.")
+    # ── Resolve all configured channels ──────────────────────────────────────
+    channel_entities: list[tuple] = []
+    for config in CHANNELS:
+        entity = await resolve_channel(config["tg_channel"])
+        if entity is None:
+            logger.error("Cannot resolve channel '%s' — skipping.", config["tg_channel"])
+            continue
+        channel_entities.append((entity, config))
+
+    if not channel_entities:
+        logger.critical("No channels could be resolved — aborting.")
         await tg_client.disconnect()
         await discord_bot.close()
         sys.exit(1)
 
-    # ── Catch up on any messages missed while the bot was offline ────────────
-    await catchup_missed_messages(channel_entity)
+    # ── Catch up on missed messages for all channels ──────────────────────────
+    for entity, config in channel_entities:
+        await catchup_missed_messages(entity, config)
 
     # ── Start listening ───────────────────────────────────────────────────────
     telegram_task = asyncio.create_task(
-        start_telegram_listener(channel_entity),
+        start_telegram_listener(channel_entities),
         name="telegram_listener",
     )
 
